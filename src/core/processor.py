@@ -20,7 +20,7 @@ class Processor:
     successor_id: Optional[int] = None
     predecessor_id: Optional[int] = None
 
-    # keys currently stored on this processor (key IDs).
+    # keys currently stored on this processor (external key labels as str).
     keys: Set[str] = field(default_factory=set)
 
     # finger_table[k] = node_id of the successor of (n + 2^k)
@@ -28,15 +28,15 @@ class Processor:
 
 
 
-    def add_key(self, key_id: int) -> None:
+    def add_key(self, key_id: str) -> None:
         """Store a key on this processor."""
         self.keys.add(key_id)
 
-    def remove_key(self, key_id: int) -> None:
+    def remove_key(self, key_id: str) -> None:
         """Remove a key from this processor if present."""
         self.keys.discard(key_id)
 
-    def has_key(self, key_id: int) -> bool:
+    def has_key(self, key_id: str) -> bool:
         """Check whether this processor currently stores the given key."""
         return key_id in self.keys
 

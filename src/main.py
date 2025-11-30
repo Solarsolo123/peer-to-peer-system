@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import argparse
+import argparse, random
 from pathlib import Path
 
-from core.network import Network
-from utils.initial_loader import load_initial_data
+from src.core.network import Network
+from src.utils.initial_loader import load_initial_data
 
 
 def main() -> None:
@@ -36,12 +36,25 @@ def main() -> None:
     print(f"Initialized network with m_bits = {m_bits}")
     print("Internal nodes and their state:")
 
+    # choose random alive processor for user
+    alive_ids = [nid for nid, p in net.processors.items() if p.alive]
+    entry_id = random.choice(alive_ids)
+    current_node_label = net.node_id_to_label[entry_id]
+
+    print(f"You are attached to node {current_node_label}")
+
     net.print_state_external()
 
     print("Enter commands. Supported:")
-    print("  find <key>   - find where a key is stored")
-    print("  add <processorID>         - add new processor")
-    print("  quit         - exit the program")
+    print("  where                          - show current attached node")
+    print("  move <nodeLabel>               - move to another alive node")
+    print("  find <keyLabel>                - route a lookup for the given key")
+    print("  add <processorLabel>           - create a new processor")
+    print("  end <processorLabel>           - gracefully remove a processor")
+    print("  crash <processorLabel>         - crash a processor (no key migration)")
+    print("  show                           - print current network state")
+    print("  step                           - run one full stabilization step")
+    print("  quit                           - exit the program")
 
     while True:
         try:
@@ -58,42 +71,124 @@ def main() -> None:
         parts = line.split()
         cmd = parts[0].lower()
 
+        if cmd == "where":
+            print(f"Current node: {current_node_label}")
+            continue
+
+        if cmd == "move":
+            if len(parts) < 2:
+                print("Usage: move <ProcessorID>")
+                continue
+            new_label = parts[1]
+            if (
+                    new_label in net.node_label_to_id
+                    and net.processors[net.node_label_to_id[new_label]].alive
+            ):
+                current_node_label = new_label
+                print(f"Now attached to node {current_node_label}")
+            else:
+                print("Cannot move: target node not alive or does not exist.")
+            continue
+
         if cmd in ("quit", "exit"):
             print("Bye.")
             break
 
+        # print current network state
+        if cmd == "show":
+            net.print_state_external()
+            continue
+
+        # run one full stabilization step
+        if cmd == "step":
+            net.tick_once(max_nodes=0)
+            print("One full stabilization step executed.")
+            continue
+
         if cmd == "find":
             if len(parts) < 2:
-                print("Usage: find <key>")
+                print("Usage: find <KeyID>")
                 continue
-
             key_label = parts[1]
-            node_label = net.find_key(key_label)
-
-            if node_label is None:
-                print(f"Key '{key_label}' is not stored anywhere in the system.")
-            else:
-                print(f"Key '{key_label}' is stored at node '{node_label}'.")
+            result = net.route_find_key_from(current_node_label, key_label)
+            print("Route:", " -> ".join(result["path_external"]))
+            print("Responsible:", result["responsible_node"])
+            print("Stored:", result["stored"])
+            print("Consistent with ideal ring:", result["consistent"])
+            print("Routing retries:", result["retries"])
+            net.tick_once(max_nodes=2)
             continue
 
         if cmd == "add":
             if len(parts) < 2:
-                print("Usage: add <ProcessorID>")
+                print("Usage: add <processorLabel>")
                 continue
 
-            result = net.add_processor(parts[1])
+            proc_label = parts[1]
+            result = net.add_processor(proc_label)
 
             if not result["success"]:
                 print("[Error]", result["error"])
                 continue
 
             print(f"Processor {result['new_processor']} created successfully.")
-
             if result["moved_keys"]:
                 print("Keys moved to the new processor:")
                 print(" ", result["moved_keys"])
             else:
                 print("No keys moved.")
+
+            net.tick_once(max_nodes=2)
+            continue
+
+        # gracefully end processor
+        if cmd == "end":
+            if len(parts) < 2:
+                print("Usage: end <processorLabel>")
+                continue
+
+            target_label = parts[1]
+
+            if target_label == current_node_label:
+                print("You cannot end the processor you are currently attached to.")
+                continue
+
+            result = net.end_processor(target_label)
+
+            if not result["success"]:
+                print("[Error]", result["error"])
+                continue
+
+            print(f"Processor {target_label} ended successfully.")
+            if result["moved_keys"]:
+                print("Keys moved from the ended processor:")
+                print(" ", result["moved_keys"])
+            else:
+                print("No keys needed to be moved.")
+
+            net.tick_once(max_nodes=2)
+            continue
+
+        # crash processor (no key migration)
+        if cmd == "crash":
+            if len(parts) < 2:
+                print("Usage: crash <processorLabel>")
+                continue
+
+            target_label = parts[1]
+
+            if target_label == current_node_label:
+                print("You cannot crash the processor you are currently attached to.")
+                continue
+
+            result = net.crash_processor(target_label)
+
+            if not result["success"]:
+                print("[Error]", result["error"])
+                continue
+
+            print(f"Processor {target_label} crashed.")
+            net.tick_once(max_nodes=2)
             continue
 
 

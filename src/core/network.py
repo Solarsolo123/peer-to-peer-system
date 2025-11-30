@@ -1,10 +1,6 @@
-# src/core/network.py
-
 from __future__ import annotations
-
-import hashlib
+import hashlib, random
 from typing import Any, Dict, List, Optional, Set
-
 from src.core.processor import Processor
 
 
@@ -174,17 +170,17 @@ class Network:
             print(f"  keys (external): {external_keys}")
             print()
 
-    def find_key(self, key_label: Any):
-        if not self._sorted_node_ids:
-            return None
-        key_label = str(key_label)
-        hash_key = self._hash_to_id(key_label)
-        node_id = self._find_responsible_node_id(hash_key)
-        proc = self.processors[node_id]
-        if proc.has_key(key_label):
-            return self.node_id_to_label.get(node_id, str(node_id))
-        else:
-            return None
+    # def find_key(self, key_label: Any):
+    #     if not self._sorted_node_ids:
+    #         return None
+    #     key_label = str(key_label)
+    #     hash_key = self._hash_to_id(key_label)
+    #     node_id = self._find_responsible_node_id(hash_key)
+    #     proc = self.processors[node_id]
+    #     if proc.has_key(key_label):
+    #         return self.node_id_to_label.get(node_id, str(node_id))
+    #     else:
+    #         return None
 
     def add_processor(self, processor_label: Any):
         if len(self.processors) == self.max_id:
@@ -218,10 +214,13 @@ class Network:
 
         for key in list(self.processors[succ].keys):
             key_id = self.key_label_to_id[key]
-            if self.is_in_range(key_id, pre, internal_id):
+            if self._in_range(key_id, pre, internal_id):
                 self.processors[succ].keys.remove(key)
                 self.processors[internal_id].keys.add(key)
                 moved_keys.append(key)
+
+        self._build_ring()
+        self.build_finger_tables()
 
         if moved_keys:
             print(f"Keys moved to new processor {label}:")
@@ -262,11 +261,12 @@ class Network:
 
         idx = self._sorted_node_ids.index(internal_id)
         pre = self._sorted_node_ids[idx - 1]
-        succ = self._sorted_node_ids[(idx + 1) % len(self._sorted_node_ids)]
+        succ_id = self._sorted_node_ids[(idx + 1) % len(self._sorted_node_ids)]
         moved_labels = sorted(proc.keys)
 
-        for label in moved_labels:
-            succ.add_key(label)
+        succ = self.processors[succ_id]
+        for l in moved_labels:
+            succ.add_key(l)
         proc.keys.clear()
 
         # delete this processor, rebuild ring / finger tables
@@ -295,6 +295,32 @@ class Network:
                 "new_processor": label,
                 "moved_keys": None,
             }
+
+    def crash_processor(self, processor_label: Any):
+        """
+        Mark a processor as crashed (alive=False).
+        The crashed node remains in processors[], but is ignored by stabilize().
+
+        Crashed ≠ End. Crash does NOT move keys.
+        Keys remain inaccessible until stabilize() repairs the ring.
+        """
+        label = str(processor_label)
+        if label not in self.node_label_to_id:
+            return {
+                "success": False,
+                "error": f"Cannot crash: processor '{label}' not found.",
+            }
+
+        internal_id = self.node_label_to_id[label]
+        proc = self.processors[internal_id]
+        proc.alive = False
+
+        return {
+            "success": True,
+            "error": None,
+            "crashed": label,
+        }
+
     # ------------------------------------------------------------------
     # ring construction and key placement
     # ------------------------------------------------------------------
@@ -340,9 +366,9 @@ class Network:
             # wrap around case
             return key > pre or key <= new
 
-        # ------------------------------------------------------------------
-        # finger tables and Chord-style routing
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # finger tables and Chord-style routing
+    # ------------------------------------------------------------------
 
     def build_finger_tables(self) -> None:
         """
@@ -363,7 +389,7 @@ class Network:
                 succ_id = self._find_responsible_node_id(start)
                 proc.finger_table.append(succ_id)
 
-    def _closest_preceding_finger(self, current_id: int, key_id: int) -> int:
+    def _closest_preceding_finger_alive(self, current_id: int, key_id: int) -> int:
         """
         From current_id, scan its finger table from largest to smallest,
         and return the finger node_id that lies in (current_id, key_id),
@@ -376,93 +402,228 @@ class Network:
         for finger_id in reversed(proc.finger_table):
             if finger_id is None:
                 continue
-            # here we assume all nodes are alive; later you can skip crashed ones
-            if self._in_range(finger_id, current_id, key_id):
-                return finger_id
+            f = self.processors.get(finger_id)
+            if f is None or not f.alive:
+                continue
+            if self._in_range(f.node_id, current_id, key_id):
+                return f.node_id
 
         return current_id
 
-    def route_find_key_from(
-            self, start_label: Any, key_label: Any
-    ) -> Dict[str, Any]:
+    def _notify(self, successor_id: int, potential_pred_id: int) -> None:
         """
-        Simulate Chord routing from the given start node to find the key.
+        successor.notify(potential_predecessor)
 
-        Returns:
+        successor 会根据 Chord 论文规则更新自己的 predecessor：
+          - 如果当前 predecessor 为空，或
+          - potential_predecessor 更接近自己（在 (predecessor, self] 区间）
+        """
+        succ = self.processors.get(successor_id)
+        if succ is None or not succ.alive:
+            return
+
+        n = self.processors.get(potential_pred_id)
+        if n is None or not n.alive:
+            return
+
+        # 当前 predecessor
+        cur_pred_id = succ.predecessor_id
+
+        if cur_pred_id is None:
+            succ.predecessor_id = potential_pred_id
+            return
+
+        # 如果 potential_pred 在 (cur_pred, succ]，则更新
+        if self._in_range(potential_pred_id, cur_pred_id, succ.node_id):
+            succ.predecessor_id = potential_pred_id
+
+    def _stabilize_one_node(self, node_id: int) -> None:
+        """
+        对某一个 alive 节点执行一次 Chord stabilize 协议。
+
+        伪代码：
+          n = this node
+          x = successor.predecessor
+          if x in (n, successor): successor = x
+          successor.notify(n)
+        """
+        n = self.processors.get(node_id)
+        if n is None or not n.alive:
+            return
+
+        succ_id = n.successor_id
+        if succ_id is None:
+            return
+
+        # 跳过 crash 的 successor（用 successor.successor 一直往前跳）
+        # 注意最多跳 len(nodes) 次，防止死循环
+        hops = 0
+        while True:
+            succ = self.processors.get(succ_id)
+            if succ is None:
+                return
+            if succ.alive:
+                break
+            succ_id = succ.successor_id
+            hops += 1
+            if hops > len(self.processors):
+                return
+
+        n.successor_id = succ_id
+        succ = self.processors[succ_id]
+
+        # x = successor.predecessor
+        x_id = succ.predecessor_id
+        if x_id is not None:
+            x = self.processors.get(x_id)
+            if x is not None and x.alive:
+                # 如果 x 在 (n, succ] 区间内，则更新 successor = x
+                if self._in_range(x.node_id, n.node_id, succ.node_id):
+                    n.successor_id = x.node_id
+                    succ = x  # 新 successor
+
+        # 通知 successor：我可能是你的 predecessor
+        self._notify(succ.node_id, n.node_id)
+
+    def tick_once(self, max_nodes: int = 0) -> None:
+        """
+        时间前进一格（逻辑时钟），这一格中随机选一些 alive 节点执行 stabilize。
+
+        max_nodes = 0 表示“这一 tick 里所有 alive 节点都执行一次 stabilize”
+        max_nodes > 0 表示“随机选最多 max_nodes 个节点执行”
+        """
+        alive_ids = [nid for nid, p in self.processors.items() if p.alive]
+        if not alive_ids:
+            return
+
+        if max_nodes <= 0 or max_nodes >= len(alive_ids):
+            chosen = alive_ids
+        else:
+            chosen = random.sample(alive_ids, max_nodes)
+
+        for nid in chosen:
+            self._stabilize_one_node(nid)
+
+        # stabilize 之后，可以顺手重建 finger table，让路由更快收敛
+        self.build_finger_tables()
+
+    def route_find_key_from(self, start_label: Any, key_label: Any) -> Dict[str, Any]:
+        """
+        从 start_label 节点出发，模拟 Chord finger table 查找 key_label。
+        内部会用 ideal结果检查是否一致，不一致时自动执行一次全网 stabilize 并重试一次。
+
+        返回:
           {
-            "path_internal": [int, ...],
-            "path_external": [str, ...],
-            "responsible_node": str,   # external label
-            "stored": bool             # whether key is actually stored there
+            "path_external": [...],
+            "responsible_node": Optional[str],
+            "stored": bool,
+            "consistent": bool,   # routing_end vs ideal 是否一致
+            "retries": int        # 为了得到最终结果做了几次 routing
           }
         """
-        if not self._sorted_node_ids:
-            return {
-                "path_internal": [],
-                "path_external": [],
-                "responsible_node": None,
-                "stored": False,
-            }
-
         key_str = str(key_label)
         key_id = self._hash_to_id(key_str)
 
-        # get start internal id
-        start_label_str = str(start_label)
-        start_id = self.node_label_to_id.get(start_label_str)
-        if start_id is None:
-            # if start node not found, fall back to smallest node
-            start_id = self._sorted_node_ids[0]
+        def _route_once() -> (List[int], Optional[int]):
+            # 起点
+            start_str = str(start_label)
+            start_id = self.node_label_to_id.get(start_str)
+            if start_id is None or not self.processors[start_id].alive:
+                # fallback：挑一个 alive 节点作为起点
+                alive_ids = [nid for nid, p in self.processors.items() if p.alive]
+                if not alive_ids:
+                    return [], None
+                start_id = alive_ids[0]
 
-        path_internal: List[int] = []
-        current_id = start_id
+            path: List[int] = []
+            current_id = start_id
+            max_hops = len(self.processors) * 2 if self.processors else 0
 
-        # safety limit to avoid infinite loop
-        max_hops = len(self._sorted_node_ids) * 2
+            for _ in range(max_hops):
+                path.append(current_id)
+                cur_proc = self.processors[current_id]
 
-        for _ in range(max_hops):
-            path_internal.append(current_id)
-            current_proc = self.processors[current_id]
-            succ_id = current_proc.successor_id
-            if succ_id is None:
-                break
+                # 处理 successor（跳过 crash 的）
+                succ_id = cur_proc.successor_id
+                hops = 0
+                while succ_id is not None and not self.processors[succ_id].alive:
+                    succ_id = self.processors[succ_id].successor_id
+                    hops += 1
+                    if hops > len(self.processors):
+                        succ_id = None
+                        break
 
-            # if key lies between current and successor, jump to successor and stop
-            if self._in_range(key_id, current_id, succ_id):
-                path_internal.append(succ_id)
-                current_id = succ_id
-                break
+                if succ_id is None:
+                    break
 
-            # otherwise, move to closest preceding finger
-            next_id = self._closest_preceding_finger(current_id, key_id)
-            if next_id == current_id:
-                # cannot move forward, stop here
-                break
-            current_id = next_id
+                # 如果 key 落在 (current, succ] 区间，下一跳就是 succ，停在 succ
+                if self._in_range(key_id, current_id, succ_id):
+                    path.append(succ_id)
+                    current_id = succ_id
+                    break
 
-        # current_id should be the responsible node (according to routing)
-        responsible_internal = self._find_responsible_node_id(key_id)
-        responsible_label = self.node_id_to_label.get(
-            responsible_internal, str(responsible_internal)
-        )
+                # 否则走 finger
+                next_id = self._closest_preceding_finger_alive(current_id, key_id)
+                if next_id == current_id:
+                    # 走不动了，只能停在当前节点
+                    break
+                current_id = next_id
 
-        # check if key is actually stored at responsible node
-        responsible_proc = self.processors[responsible_internal]
-        stored = responsible_proc.has_key(key_id)
+            return path, current_id
+
+        # 第一次 routing
+        path_internal, end_id = _route_once()
+        retries = 1
+
+        if end_id is None:
+            return {
+                "path_external": [],
+                "responsible_node": None,
+                "stored": False,
+                "consistent": False,
+                "retries": retries,
+            }
+
+        # ideal 负责节点（数学正确答案）
+        ideal_id = self._find_responsible_node_id(key_id)
+        ideal_proc = self.processors[ideal_id]
+        ideal_alive = ideal_proc.alive
+
+        consistent = (end_id == ideal_id and ideal_alive)
+
+        # 如果不一致，尝试 stabilize + 再试一次
+        if not consistent:
+            # 全网 stabilize 一轮
+            self.tick_once(max_nodes=0)
+            # 再路由一次
+            path_internal, end_id = _route_once()
+            retries += 1
+            # 再对比
+            ideal_id = self._find_responsible_node_id(key_id)
+            ideal_proc = self.processors[ideal_id]
+            ideal_alive = ideal_proc.alive
+            consistent = (end_id == ideal_id and ideal_alive)
+
+        # 最终负责节点：我们选择 ideal 作为最终判定者
+        if not ideal_alive:
+            responsible_label = None
+            stored = False
+        else:
+            responsible_label = self.node_id_to_label.get(ideal_id, str(ideal_id))
+            # 注意：我们用 external key_str 检查是否真的存了这个 key
+            stored = ideal_proc.has_key(key_str)
 
         path_external = [
             self.node_id_to_label.get(nid, str(nid)) for nid in path_internal
         ]
 
         return {
-            "path_internal": path_internal,
             "path_external": path_external,
             "responsible_node": responsible_label,
             "stored": stored,
+            "consistent": consistent,
+            "retries": retries,
         }
-
-
-
 
     # ------------------------------------------------------------------
     # helper accessors (useful for CLI and router)
