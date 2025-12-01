@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse, random
+from multiprocessing.spawn import old_main_modules
 from pathlib import Path
 
 from src.core.network import Network
@@ -40,6 +41,7 @@ def main() -> None:
     alive_ids = [nid for nid, p in net.processors.items() if p.alive]
     entry_id = random.choice(alive_ids)
     current_node_label = net.node_id_to_label[entry_id]
+    #current_node_label = '30'
 
     print(f"You are attached to node {current_node_label}")
 
@@ -111,13 +113,18 @@ def main() -> None:
                 continue
             key_label = parts[1]
             result = net.route_find_key_from(current_node_label, key_label)
-            print("Route:", " -> ".join(result["path_external"]))
-            print("Responsible:", result["responsible_node"])
-            print("Stored:", result["stored"])
-            print("Consistent with ideal ring:", result["consistent"])
-            print("Routing retries:", result["retries"])
-            net.tick_once(max_nodes=2)
-            continue
+
+            if result["stored"] != True:
+                print("This key is not found in this network.")
+                continue
+            else:
+                print("Route:", " -> ".join(result["path_external"]))
+                print("Responsible:", result["responsible_node"])
+                print("Stored:", result["stored"])
+                print("Consistent with ideal ring:", result["consistent"])
+                print("Routing retries:", result["retries"])
+                net.tick_once(max_nodes=2)
+                continue
 
         if cmd == "add":
             if len(parts) < 2:
@@ -133,6 +140,8 @@ def main() -> None:
 
             print(f"Processor {result['new_processor']} created successfully.")
             if result["moved_keys"]:
+                print("Old processor:",result["old_processor"])
+                print("Old processor internal id:", result["old_processorid"])
                 print("Keys moved to the new processor:")
                 print(" ", result["moved_keys"])
             else:
@@ -160,9 +169,12 @@ def main() -> None:
                 continue
 
             print(f"Processor {target_label} ended successfully.")
+            print("Ended processor internal id:", result["old_processorid"])
             if result["moved_keys"]:
                 print("Keys moved from the ended processor:")
                 print(" ", result["moved_keys"])
+                print("Keys moved to new processor:",result["new_processor"])
+                print("new processor internal id:", result["new_processorid"])
             else:
                 print("No keys needed to be moved.")
 

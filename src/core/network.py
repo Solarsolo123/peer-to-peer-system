@@ -165,9 +165,11 @@ class Network:
             external_keys = proc.keys
 
             print(f"Node {node_label} (internal_id={internal_id})")
+            print(f"status: {proc.alive}")
             print(f"  successor: {self.node_id_to_label.get(proc.successor_id, proc.successor_id)}")
             print(f"  predecessor: {self.node_id_to_label.get(proc.predecessor_id, proc.predecessor_id)}")
             print(f"  keys (external): {external_keys}")
+            print(f"  fingertable: {proc.finger_table}")
             print()
 
     # def find_key(self, key_label: Any):
@@ -223,11 +225,11 @@ class Network:
         self.build_finger_tables()
 
         if moved_keys:
-            print(f"Keys moved to new processor {label}:")
-            print(f"  {sorted(k for k in moved_keys)}")
             return {
                 "success": True,
                 "error": None,
+                "old_processor": self.processors[succ].label,
+                "old_processorid": self.processors[succ].node_id,
                 "new_processor": label,
                 "moved_keys": sorted(k for k in moved_keys),
             }
@@ -279,12 +281,14 @@ class Network:
 
 
         if moved_labels:
-            print(f"Keys moved to new processor {label}:")
-            print(f"  {sorted(k for k in moved_labels)}")
+            # print(f"Keys moved to new processor {label}:")
+            # print(f"  {sorted(k for k in moved_labels)}")
             return {
                 "success": True,
                 "error": None,
-                "new_processor": label,
+                "new_processor": succ.label,
+                "new_processorid": succ.node_id,
+                "old_processorid": internal_id,
                 "moved_keys": sorted(k for k in moved_labels),
             }
         else:
@@ -292,7 +296,9 @@ class Network:
             return {
                 "success": True,
                 "error": None,
-                "new_processor": label,
+                "new_processor": succ.label,
+                "new_processorid": succ.node_id,
+                "old_processorid": internal_id,
                 "moved_keys": None,
             }
 
@@ -387,14 +393,11 @@ class Network:
             for k in range(self.m_bits):
                 start = (node_id + (1 << k)) % self.max_id
                 succ_id = self._find_responsible_node_id(start)
-                proc.finger_table.append(succ_id)
+                succ_label = self.node_id_to_label[succ_id]
+                #proc.finger_table.append(succ_id)
+                proc.finger_table.append(succ_label)
 
     def _closest_preceding_finger_alive(self, current_id: int, key_id: int) -> int:
-        """
-        From current_id, scan its finger table from largest to smallest,
-        and return the finger node_id that lies in (current_id, key_id),
-        if any. If none, return current_id itself.
-        """
         proc = self.processors[current_id]
         if not proc.finger_table:
             return current_id
@@ -408,7 +411,8 @@ class Network:
             if self._in_range(f.node_id, current_id, key_id):
                 return f.node_id
 
-        return current_id
+        #return current_id
+        return None
 
     def _notify(self, successor_id: int, potential_pred_id: int) -> None:
         """
@@ -529,7 +533,6 @@ class Network:
             start_str = str(start_label)
             start_id = self.node_label_to_id.get(start_str)
             if start_id is None or not self.processors[start_id].alive:
-                # fallback：挑一个 alive 节点作为起点
                 alive_ids = [nid for nid, p in self.processors.items() if p.alive]
                 if not alive_ids:
                     return [], None
@@ -537,13 +540,19 @@ class Network:
 
             path: List[int] = []
             current_id = start_id
+            visited: Set[int] = set()
             max_hops = len(self.processors) * 2 if self.processors else 0
 
             for _ in range(max_hops):
+                if current_id in visited:
+                    # 已经绕回来了，说明拓扑有问题，停止
+                    break
+                visited.add(current_id)
+
                 path.append(current_id)
                 cur_proc = self.processors[current_id]
 
-                # 处理 successor（跳过 crash 的）
+                # 找 successor（跳过 crashed 的）
                 succ_id = cur_proc.successor_id
                 hops = 0
                 while succ_id is not None and not self.processors[succ_id].alive:
@@ -554,19 +563,22 @@ class Network:
                         break
 
                 if succ_id is None:
+                    # 没 successor，路由终止
                     break
 
-                # 如果 key 落在 (current, succ] 区间，下一跳就是 succ，停在 succ
+                # ① key 在 (current, succ] 上 → succ 是负责节点，结束
                 if self._in_range(key_id, current_id, succ_id):
                     path.append(succ_id)
                     current_id = succ_id
                     break
 
-                # 否则走 finger
+                # ② 否则找 “closest preceding finger”
                 next_id = self._closest_preceding_finger_alive(current_id, key_id)
-                if next_id == current_id:
-                    # 走不动了，只能停在当前节点
-                    break
+
+                # finger 帮不上忙 → 至少往 successor 方向走一步
+                if next_id is None or next_id == current_id:
+                    next_id = succ_id
+
                 current_id = next_id
 
             return path, current_id
