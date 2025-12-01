@@ -383,19 +383,33 @@ class Network:
         For each node n and each k in [0, m_bits),
         finger[k] = successor of (n + 2^k) mod 2^m.
         """
-        ids = self._sorted_node_ids
-        if not ids:
+        # 只用 alive 的节点构造 finger table
+        alive_ids = [nid for nid, p in self.processors.items() if p.alive]
+        alive_ids.sort()
+
+        if not alive_ids:
             return
 
-        for node_id in ids:
+        def find_alive_successor(start: int) -> int:
+            # 在 alive_ids 里找到第一个 >= start 的节点
+            for nid in alive_ids:
+                if nid >= start:
+                    return nid
+            # 如果没有，则 wrap 到最小的
+            return alive_ids[0]
+
+        for node_id in alive_ids:
             proc = self.processors[node_id]
             proc.finger_table = []
             for k in range(self.m_bits):
                 start = (node_id + (1 << k)) % self.max_id
-                succ_id = self._find_responsible_node_id(start)
-                succ_label = self.node_id_to_label[succ_id]
-                #proc.finger_table.append(succ_id)
-                proc.finger_table.append(succ_label)
+                succ_id = find_alive_successor(start)
+                proc.finger_table.append(succ_id)
+
+        # # 对于 crashed 节点，可以选择清空 finger_table（避免 show 时误导）
+        # for nid, p in self.processors.items():
+        #     if not p.alive:
+        #         p.finger_table = []
 
     def _closest_preceding_finger_alive(self, current_id: int, key_id: int) -> int:
         proc = self.processors[current_id]
