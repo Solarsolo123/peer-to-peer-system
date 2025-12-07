@@ -172,17 +172,6 @@ class Network:
             print(f"  fingertable: {proc.finger_table}")
             print()
 
-    # def find_key(self, key_label: Any):
-    #     if not self._sorted_node_ids:
-    #         return None
-    #     key_label = str(key_label)
-    #     hash_key = self._hash_to_id(key_label)
-    #     node_id = self._find_responsible_node_id(hash_key)
-    #     proc = self.processors[node_id]
-    #     if proc.has_key(key_label):
-    #         return self.node_id_to_label.get(node_id, str(node_id))
-    #     else:
-    #         return None
 
     def add_processor(self, processor_label: Any):
         if len(self.processors) == self.max_id:
@@ -222,6 +211,7 @@ class Network:
                 moved_keys.append(key)
 
         self._build_ring()
+        # fingertable的形式可以改一下
         self.build_finger_tables()
 
         if moved_keys:
@@ -426,6 +416,65 @@ class Network:
                 return f.node_id
 
         #return current_id
+        return None
+
+    def _find_successor_via_routing(self, start_id: int, key_id: int) -> Optional[int]:
+        """
+        Starting from start_id, route using Chord-style finger table
+        to find the alive successor responsible for key_id.
+
+        This roughly follows the same logic as route_find_key_from(),
+        but only returns the final successor ID (or None on failure).
+        """
+        if not self.processors:
+            return None
+
+        # 如果起点不存在或已挂，选一个 alive 节点作为起点
+        if start_id not in self.processors or not self.processors[start_id].alive:
+            alive_ids = [nid for nid, p in self.processors.items() if p.alive]
+            if not alive_ids:
+                return None
+            start_id = alive_ids[0]
+
+        current_id = start_id
+        visited: Set[int] = set()
+        max_hops = len(self.processors) * 2 if self.processors else 0
+
+        for _ in range(max_hops):
+            if current_id in visited:
+                # 回到了之前访问过的节点，说明拓扑有问题，停止
+                break
+            visited.add(current_id)
+
+            cur_proc = self.processors[current_id]
+
+            # 找到当前节点的第一个 alive successor（跳过 crashed 的）
+            succ_id = cur_proc.successor_id
+            hops = 0
+            while succ_id is not None and succ_id in self.processors and not self.processors[succ_id].alive:
+                succ_id = self.processors[succ_id].successor_id
+                hops += 1
+                if hops > len(self.processors):
+                    succ_id = None
+                    break
+
+            if succ_id is None or succ_id not in self.processors:
+                # successor 不可用，停止
+                break
+
+            # 如果 key_id 落在 (current, succ]，succ 就是负责节点
+            if self._in_range(key_id, current_id, succ_id):
+                return succ_id
+
+            # 否则按 closest-preceding-finger 选择下一跳
+            next_id = self._closest_preceding_finger_alive(current_id, key_id)
+
+            # finger 帮不上忙，就至少往 successor 方向走一步
+            if next_id is None or next_id == current_id:
+                next_id = succ_id
+
+            current_id = next_id
+
         return None
 
     def _notify(self, successor_id: int, potential_pred_id: int) -> None:

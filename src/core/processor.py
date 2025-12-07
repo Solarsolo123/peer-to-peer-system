@@ -23,7 +23,6 @@ class Processor:
     # keys currently stored on this processor (external key labels as str).
     keys: Set[str] = field(default_factory=set)
 
-    # finger_table[k] = node_id of the successor of (n + 2^k)
     finger_table: List[Optional[int]] = field(default_factory=list)
 
 
