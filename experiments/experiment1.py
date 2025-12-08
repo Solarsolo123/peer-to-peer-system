@@ -3,13 +3,12 @@ import os
 import random
 import matplotlib.pyplot as plt
 
-# 确保可以 import src 内的代码
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from core.network import Network
 
 
-# successor-only routing helper
 def successor_only_lookup(net: Network, start_id: int, key_id: int):
     hops = 0
     current = start_id
@@ -19,7 +18,7 @@ def successor_only_lookup(net: Network, start_id: int, key_id: int):
 
     while True:
         if current in visited:
-            return None, hops  # topology broken or loop
+            return None, hops
         visited.add(current)
 
         proc = net.processors[current]
@@ -40,14 +39,14 @@ def run_experiment():
     m_bits = 20
     sizes = [8, 16, 32, 64]
 
-    results = []  # collect all output lines here
+    results = []
     results.append("=== Experiment 1: Finger Routing vs Successor-Only ===")
 
     avg_finger_hops_per_size = []
     avg_succ_hops_per_size = []
 
     for n in sizes:
-        # 1. Generate node labels
+        # Generate node labels
         node_labels = [f"{i}" for i in range(n)]
         key_labels = [f"{i}" for i in range(200)]
 
@@ -67,7 +66,7 @@ def run_experiment():
         for key in sample_keys:
             key_id = net.get_internal_key_id(key)
 
-            # finger-based lookup (use existing route_find_key_from)
+            # finger-based lookup
             result = net.route_find_key_from(start_label, key)
             finger_hops.append(len(result["path_external"]))
 

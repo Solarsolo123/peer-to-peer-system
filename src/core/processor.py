@@ -20,6 +20,9 @@ class Processor:
     successor_id: Optional[int] = None
     predecessor_id: Optional[int] = None
 
+    # A list of candidate successors, usually of length r (e.g., r = 3 or 5).
+    successor_list: List[Optional[int]] = field(default_factory=list)
+
     # keys currently stored on this processor (external key labels as str).
     keys: Set[str] = field(default_factory=set)
 
@@ -60,6 +63,11 @@ class Processor:
         """Update the predecessor pointer."""
         self.predecessor_id = predecessor_id
 
+    def set_successor_list(self, successors: List[Optional[int]]) -> None:
+        """Replace the successor list with a new list."""
+        # make a shallow copy to avoid accidental external modification
+        self.successor_list = list(successors)
+
     def clear_neighbors(self) -> None:
         """Clear successor and predecessor pointers."""
         self.successor_id = None
@@ -88,11 +96,14 @@ class Processor:
             "successor": self.successor_id,
             "predecessor": self.predecessor_id,
             "keys": sorted(self.keys),
+            "finger_table": self.finger_table,
+            "successor_list": self.successor_list,
         }
 
     def __repr__(self) -> str:
         return (
             f"Processor(label={self.label}, id={self.node_id}, alive={self.alive}, "
             f"succ={self.successor_id}, pred={self.predecessor_id}, "
-            f"keys={sorted(self.keys)})"
+            f"keys={sorted(self.keys)},"
+            f"succ_list_len={len(self.successor_list)})"
         )

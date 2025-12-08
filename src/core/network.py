@@ -36,10 +36,15 @@ class Network:
         # one key_id may correspond to multiple external labels
         self.key_id_to_labels: Dict[int, Set[str]] = {}
 
-    # ------------------------------------------------------------------
-    # public initialization API
-    # ------------------------------------------------------------------
+        # size of successor list each node maintains
+        self.successor_list_size: int = 3
+        # total number of replicas per key (primary + secondaries)
+        self.replication_factor: int = 3
+        # remember initial node count for sanity checks
+        self._initial_node_count: int = 0
 
+
+    # public initialization API
     def init_from_labels(
         self, node_labels: List[Any], key_labels: List[Any]
     ) -> None:
@@ -53,13 +58,19 @@ class Network:
         Steps:
           1) map node labels to internal IDs using SHA-1 and create processors
           2) build successor / predecessor ring on internal IDs
-          3) map key labels to internal IDs and assign to responsible processors
+          3) assign keys (with replication) to processors
+          4) build finger tables (in initial phase, it is centralized, mainly for convergence speed)
         """
         if not node_labels:
             raise ValueError("Cannot initialize network with empty node label list")
 
         # 1) create processors from external node labels
         self._create_processors_from_labels(node_labels)
+
+
+        # >>> ADDED: set initial and minimal alive count after creation
+        self._initial_node_count = len(self.processors)
+
 
         # 2) build ring based on initial data file
         self._build_ring()
@@ -70,9 +81,8 @@ class Network:
         # 4) build finger tables
         self.build_finger_tables()
 
-    # ------------------------------------------------------------------
+
     # hashing and mapping
-    # ------------------------------------------------------------------
 
     def _hash_to_id(self, label: str) -> int:
         """
@@ -99,13 +109,13 @@ class Network:
         seen_labels: Set[str] = set()
         for raw_label in node_labels:
             label = str(raw_label)
-            print("label=",label)
+            #print("label=",label)
             if label in seen_labels:
                 continue
             seen_labels.add(label)
 
             internal_id = self._hash_to_id(label)
-            print("internal_id=", internal_id)
+            #print("internal_id=", internal_id)
             if internal_id in self.processors:
                 existing_label = self.node_id_to_label[internal_id]
                 raise ValueError(
@@ -123,6 +133,30 @@ class Network:
 
         # cache sorted internal IDs
         self._sorted_node_ids = sorted(self.processors.keys())
+
+    def _replicate_key_to_successors(self, primary_id: int, key_label: str) -> None:
+        """
+        Replicate a key from its primary node to its next successors.
+        Assumes primary already stored the key locally.
+        """
+        if primary_id not in self.processors:
+            return
+        primary = self.processors[primary_id]
+        if not primary.alive:
+            return
+
+        replicas = 1  # primary already holds one copy
+        # use successor_list as main replication target list
+        for succ_id in primary.successor_list:
+            if succ_id is None or succ_id not in self.processors:
+                continue
+            succ = self.processors[succ_id]
+            if not succ.alive:
+                continue
+            succ.add_key(key_label)
+            replicas += 1
+            if replicas >= self.replication_factor:
+                break
 
     def _assign_keys_from_labels(self, key_labels: List[Any]) -> None:
         """
@@ -151,6 +185,7 @@ class Network:
             node_id = self._find_responsible_node_id(key_id)
             proc = self.processors[node_id]
             proc.add_key(label)
+            self._replicate_key_to_successors(node_id, label)
 
     def print_state_external(self) -> None:
         """
@@ -170,7 +205,72 @@ class Network:
             print(f"  predecessor: {self.node_id_to_label.get(proc.predecessor_id, proc.predecessor_id)}")
             print(f"  keys (external): {external_keys}")
             print(f"  fingertable: {proc.finger_table}")
+            print(f"  successor_list: {[self.node_id_to_label.get(s, s) for s in proc.successor_list]}")
             print()
+
+    ###?????####
+    # count alive nodes
+    def _alive_count(self) -> int:
+        return sum(1 for p in self.processors.values() if p.alive)
+
+    def _rebuild_successor_list_for(self, node_id: int) -> None:
+        """
+        Recompute successor_list for one node by walking successor pointers.
+        Used after stabilization or membership changes.
+        """
+        n = self.processors.get(node_id)
+        if n is None or not n.alive:
+            return
+
+        successors: List[Optional[int]] = []
+        current_id = n.successor_id
+        hops = 0
+        max_hops = len(self.processors)
+
+        while current_id is not None and hops < max_hops and len(successors) < self.successor_list_size:
+            if current_id not in self.processors:
+                break
+            p = self.processors[current_id]
+            if p.alive and current_id not in successors and current_id != node_id:
+                successors.append(current_id)
+            current_id = p.successor_id
+            hops += 1
+
+        n.set_successor_list(successors)
+
+    # >>> ADDED: helper to choose the first alive successor using successor_list
+    def _first_alive_successor(self, node_id: int) -> Optional[int]:
+        """
+        Try direct successor, then successor_list, then fall back to successor chain.
+        """
+        n = self.processors.get(node_id)
+        if n is None:
+            return None
+
+        # 1) direct successor
+        sid = n.successor_id
+        if sid is not None and sid in self.processors and self.processors[sid].alive:
+            return sid
+
+        # 2) successor_list
+        for cand in n.successor_list:
+            if cand is not None and cand in self.processors and self.processors[cand].alive:
+                return cand
+
+        # 3) follow successor chain as last resort
+        succ_id = n.successor_id
+        hops = 0
+        max_hops = len(self.processors)
+        while succ_id is not None and hops < max_hops:
+            s = self.processors.get(succ_id)
+            if s is None:
+                break
+            if s.alive:
+                return succ_id
+            succ_id = s.successor_id
+            hops += 1
+
+        return None
 
     def add_processor(self, processor_label: Any, start_label: Any = None):
         """
@@ -218,6 +318,7 @@ class Network:
 
             proc.set_successor(internal_id)
             proc.set_predecessor(internal_id)
+            proc.set_successor_list([internal_id] * self.successor_list_size)
 
             # initial fingertable
             self.build_finger_tables()
@@ -229,7 +330,6 @@ class Network:
                 "moved_keys": None,
             }
 
-        # 2) Choose routing start: prefer start_label (current attached node)
         start_id: Optional[int] = None
         if start_label is not None:
             start_str = str(start_label)
@@ -244,23 +344,20 @@ class Network:
         succ_id: Optional[int] = None
 
         if start_id is not None:
-            # 2.1 First try finger-table based routing (Chord-style)
+            # First try finger-table based routing (Chord-style)
             succ_id = self._find_successor_via_routing(start_id, internal_id)
 
-            # 2.2 If routing fails (e.g., fingers are stale), fall back to
-            #     a pure-successor-based search
+            # If routing fails (e.g., fingers are stale), fall back to a pure-successor-based search
             if succ_id is None:
                 succ_id = self._find_successor_via_successor(start_id, internal_id)
 
-        # 2.3 Final fallback: use the ideal responsible node based on the
-        #     sorted ID list (centralized view), mostly for robustness
+        # Final fallback: use the ideal responsible node based on the sorted ID list (centralized view), mostly for robustness
         if succ_id is None:
             succ_id = self._find_responsible_node_id(internal_id)
 
         succ = self.processors[succ_id]
 
-        # 3) 确定 predecessor：
-        #    优先使用 succ.predecessor，如果不可用则在排序列表中找一个前驱
+        # choose predecessor：
         pred_id = succ.predecessor_id
         if pred_id is None or pred_id not in self.processors or not self.processors[pred_id].alive:
             ids = sorted(self.processors.keys())
@@ -268,21 +365,20 @@ class Network:
                 idx = ids.index(succ_id)
                 pred_id = ids[idx - 1]
             else:
-                # 极端情况下直接让它自己成为前驱
                 pred_id = succ_id
 
         pred = self.processors[pred_id]
 
-        # 4) 创建新节点并插入全局结构
+        # create new node and insert into global structures
         proc = Processor(label=label, node_id=internal_id)
         self.processors[internal_id] = proc
         self.node_label_to_id[label] = internal_id
         self.node_id_to_label[internal_id] = label
 
-        # 更新全局排序列表（用于 debug / ideal 计算）
+        # update global sorted list (for debug / ideal math)
         self._sorted_node_ids = sorted(self.processors.keys())
 
-        # 5) 从 successor 上迁移属于 (pred, new] 范围的 keys
+        # move keys in (pred, new] from successor to the new node
         moved_keys: List[str] = []
         for key in list(succ.keys):
             key_id = self.key_label_to_id[key]
@@ -291,17 +387,30 @@ class Network:
                 proc.keys.add(key)
                 moved_keys.append(key)
 
-        # 6) 局部更新 successor / predecessor 指针
+        # update local successor / predecessor pointers
         proc.set_successor(succ_id)
         proc.set_predecessor(pred_id)
 
         pred.set_successor(internal_id)
         succ.set_predecessor(internal_id)
 
-        # 7) finger table 先不全局重建，后续 tick_once 会处理。
-        #    如果希望新节点一开始有个“还行”的 finger table，可以复制 succ 的：
+        # refresh successor lists locally
+        self._rebuild_successor_list_for(pred_id)
+        self._rebuild_successor_list_for(succ_id)
+        self._rebuild_successor_list_for(internal_id)
+
+        # finger table is not globally rebuilt; new node copies succ's table
         proc.finger_table = list(succ.finger_table)
         self.update_fingers_for_new_node(internal_id)
+
+        # re-establish replication for keys for which this new node becomes the primary responsible node
+        for key in moved_keys:
+            key_id = self.key_label_to_id.get(key)
+            if key_id is None:
+                continue
+            ideal_id = self._find_responsible_node_id(key_id)
+            if ideal_id == internal_id:
+                self._replicate_key_to_successors(internal_id, key)
 
         if moved_keys:
             return {
@@ -341,21 +450,21 @@ class Network:
             }
 
         label = str(processor_label)
-        print("label=", label)
+        #print("label=", label)
         internal_id = self._hash_to_id(label)
-        print("internal_id=", internal_id)
+        #print("internal_id=", internal_id)
 
         if internal_id not in self.processors:
             raise ValueError(f"No processor founded: '{label}'")
 
         proc = self.processors[internal_id]
 
-        # 特殊情况：这是环中唯一节点
+
+        # special case: this is the only node in the ring
         if len(self.processors) == 1:
             moved_labels = sorted(proc.keys)
             proc.keys.clear()
 
-            # 从全局结构中删除
             del self.processors[internal_id]
             del self.node_label_to_id[label]
             del self.node_id_to_label[internal_id]
@@ -370,17 +479,16 @@ class Network:
                 "moved_keys": moved_labels or None,
             }
 
-        # 一般情况：至少有两个节点
         pred_id = proc.predecessor_id
         succ_id = proc.successor_id
 
-        # 如果 predecessor 丢失，用 sorted 列表兜底
+        # if predecessor unknown, fall back to sorted list
         if pred_id is None or pred_id not in self.processors:
             ids = sorted(self.processors.keys())
             idx = ids.index(internal_id)
             pred_id = ids[idx - 1]
 
-        # 如果 successor 丢失，也用 sorted 列表兜底
+        # if successor unknown, fall back to sorted list
         if succ_id is None or succ_id not in self.processors:
             ids = sorted(self.processors.keys())
             idx = ids.index(internal_id)
@@ -389,25 +497,38 @@ class Network:
         pred = self.processors[pred_id]
         succ = self.processors[succ_id]
 
-        # 1) 把所有 key 迁移给 successor
+        # move all keys to successor
         moved_labels = sorted(proc.keys)
         for l in moved_labels:
             succ.add_key(l)
         proc.keys.clear()
 
-        # 2) 局部修复 predecessor / successor 指针，让 pred 和 succ 绕过这个节点
+        # repair predecessor / successor pointers to bypass this node
         pred.set_successor(succ_id)
         succ.set_predecessor(pred_id)
 
-        # 3) 从全局结构删除该节点
+        # >>> ADDED: refresh successor lists for neighbors
+        self._rebuild_successor_list_for(pred_id)
+        self._rebuild_successor_list_for(succ_id)
+
+        # >>> ADDED: re-replicate keys for which successor is now primary
+        for l in moved_labels:
+            key_id = self.key_label_to_id.get(l)
+            if key_id is None:
+                continue
+            ideal_id = self._find_responsible_node_id(key_id)
+            if ideal_id == succ_id:
+                self._replicate_key_to_successors(succ_id, l)
+
+        # remove node from global structures
         del self.processors[internal_id]
         del self.node_label_to_id[label]
         del self.node_id_to_label[internal_id]
 
-        # 4) 只用于 ideal successor / debug 的排序列表
+        # update sorted list used for ideal math / debug
         self._sorted_node_ids = sorted(self.processors.keys())
 
-        # 5) 增量修复 finger tables 中指向该节点的条目
+        # update finger tables entries pointing to this node
         self.update_fingers_for_removed_node(internal_id)
 
         if moved_labels:
@@ -436,8 +557,8 @@ class Network:
         Mark a processor as crashed (alive=False).
         The crashed node remains in processors[], but is ignored by stabilize().
 
-        Crashed ≠ End. Crash does NOT move keys.
-        Keys remain inaccessible until stabilize() repairs the ring.
+        Crash does NOT move keys.
+        Keys remain accessible only via replicas on other nodes.
         """
         label = str(processor_label)
         if label not in self.node_label_to_id:
@@ -448,6 +569,14 @@ class Network:
 
         internal_id = self.node_label_to_id[label]
         proc = self.processors[internal_id]
+
+        if not proc.alive:
+            return {
+                "success": False,
+                "error": f"Processor '{label}' is already crashed.",
+            }
+
+
         proc.alive = False
 
         return {
@@ -456,14 +585,13 @@ class Network:
             "crashed": label,
         }
 
-    # ------------------------------------------------------------------
     # ring construction and key placement
-    # ------------------------------------------------------------------
 
     def _build_ring(self) -> None:
         """
         Set successor and predecessor pointers for all processors
         based on the initial data file.
+        This method is mainly used during initialization, not for dynamic changes.
         """
         ids = sorted(self.processors.keys())
         self._sorted_node_ids = ids
@@ -478,17 +606,17 @@ class Network:
             proc = self.processors[node_id]
             proc.set_successor(succ_id)
             proc.set_predecessor(pred_id)
+            # >>> ADDED: initialize successor_list using static ring order
+            succ_list: List[Optional[int]] = []
+            for offset in range(1, 1 + self.successor_list_size):
+                succ_list.append(ids[(i + offset) % n])
+            proc.set_successor_list(succ_list)
 
     def _find_responsible_node_id(self, key_id: int) -> int:
         """
         Given an internal key ID, find the internal node ID responsible for it.
-
-        Chord rule:
-          responsible node is the first node_id >= key_id,
-          if none, wrap around to the smallest node_id.
         """
         ids = self._sorted_node_ids
-        # linear search is enough for now; can be optimized to binary search later
         for node_id in ids:
             if node_id >= key_id:
                 return node_id
@@ -501,18 +629,15 @@ class Network:
             # wrap around case
             return key > pre or key <= new
 
-    # ------------------------------------------------------------------
+
     # finger tables and Chord-style routing
-    # ------------------------------------------------------------------
 
     def build_finger_tables(self) -> None:
         """
         Build finger tables for all processors using the current ring.
 
-        For each node n and each k in [0, m_bits),
-        finger[k] = successor of (n + 2^k) mod 2^m.
+        Only used in initial phase
         """
-        # 只用 alive 的节点构造 finger table
         alive_ids = [nid for nid, p in self.processors.items() if p.alive]
         alive_ids.sort()
 
@@ -520,11 +645,9 @@ class Network:
             return
 
         def find_alive_successor(start: int) -> int:
-            # 在 alive_ids 里找到第一个 >= start 的节点
             for nid in alive_ids:
                 if nid >= start:
                     return nid
-            # 如果没有，则 wrap 到最小的
             return alive_ids[0]
 
         for node_id in alive_ids:
@@ -563,20 +686,17 @@ class Network:
     def update_fingers_for_removed_node(self, removed_id: int) -> None:
         """
         Incrementally update finger tables of existing nodes after a node is
-        gracefully removed. Any finger entry that used to point to removed_id
-        will be updated to its new mathematically correct successor.
-
+        gracefully removed.
         This avoids a full global rebuild of all finger tables.
         """
         if not self.processors:
             return
 
-        # 遍历所有 still-alive 节点
         for p_id, p in self.processors.items():
             if not p.alive:
                 continue
 
-            # 确保 finger_table 长度正确
+
             if len(p.finger_table) < self.m_bits:
                 p.finger_table += [p.successor_id] * (self.m_bits - len(p.finger_table))
 
@@ -584,7 +704,6 @@ class Network:
                 if p.finger_table[i] != removed_id:
                     continue
 
-                # 对这一条 finger 重新计算理想 successor
                 start = (p.node_id + (1 << i)) % self.max_id
                 ideal = self._find_responsible_node_id(start)
                 p.finger_table[i] = ideal
@@ -617,7 +736,7 @@ class Network:
         if not self.processors:
             return None
 
-        # 如果起点不存在或已挂，选一个 alive 节点作为起点
+        # if start node is invalid or crashed, pick any alive node
         if start_id not in self.processors or not self.processors[start_id].alive:
             alive_ids = [nid for nid, p in self.processors.items() if p.alive]
             if not alive_ids:
@@ -630,34 +749,23 @@ class Network:
 
         for _ in range(max_hops):
             if current_id in visited:
-                # 回到了之前访问过的节点，说明拓扑有问题，停止
+                # loop detected, topology is broken
                 break
             visited.add(current_id)
 
-            cur_proc = self.processors[current_id]
-
-            # 找到当前节点的第一个 alive successor（跳过 crashed 的）
-            succ_id = cur_proc.successor_id
-            hops = 0
-            while succ_id is not None and succ_id in self.processors and not self.processors[succ_id].alive:
-                succ_id = self.processors[succ_id].successor_id
-                hops += 1
-                if hops > len(self.processors):
-                    succ_id = None
-                    break
+            # use successor (skipping crashed) with successor_list help
+            succ_id = self._first_alive_successor(current_id)
 
             if succ_id is None or succ_id not in self.processors:
-                # successor 不可用，停止
                 break
 
-            # 如果 key_id 落在 (current, succ]，succ 就是负责节点
+            # if key_id falls into (current, succ], succ is responsible
             if self._in_range(key_id, current_id, succ_id):
                 return succ_id
 
-            # 否则按 closest-preceding-finger 选择下一跳
+            # otherwise use closest-preceding-finger as next hop
             next_id = self._closest_preceding_finger_alive(current_id, key_id)
 
-            # finger 帮不上忙，就至少往 successor 方向走一步
             if next_id is None or next_id == current_id:
                 next_id = succ_id
 
@@ -677,7 +785,7 @@ class Network:
         if not self.processors:
             return None
 
-        # If the start node is invalid or crashed, pick any alive node
+            # If the start node is invalid or crashed, pick any alive node
         if start_id not in self.processors or not self.processors[start_id].alive:
             alive_ids = [nid for nid, p in self.processors.items() if p.alive]
             if not alive_ids:
@@ -694,18 +802,7 @@ class Network:
                 break
             visited.add(current_id)
 
-            cur = self.processors[current_id]
-
-            # follow successor, skipping crashed nodes
-            succ_id = cur.successor_id
-            hops = 0
-            while succ_id is not None and succ_id in self.processors and not self.processors[succ_id].alive:
-                succ_id = self.processors[succ_id].successor_id
-                hops += 1
-                if hops > len(self.processors):
-                    succ_id = None
-                    break
-
+            succ_id = self._first_alive_successor(current_id)
             if succ_id is None or succ_id not in self.processors:
                 break
 
@@ -720,10 +817,6 @@ class Network:
     def _notify(self, successor_id: int, potential_pred_id: int) -> None:
         """
         successor.notify(potential_predecessor)
-
-        successor 会根据 Chord 论文规则更新自己的 predecessor：
-          - 如果当前 predecessor 为空，或
-          - potential_predecessor 更接近自己（在 (predecessor, self] 区间）
         """
         succ = self.processors.get(successor_id)
         if succ is None or not succ.alive:
@@ -733,22 +826,21 @@ class Network:
         if n is None or not n.alive:
             return
 
-        # 当前 predecessor
         cur_pred_id = succ.predecessor_id
 
         if cur_pred_id is None:
             succ.predecessor_id = potential_pred_id
             return
 
-        # 如果 potential_pred 在 (cur_pred, succ]，则更新
+        # update predecessor if potential_pred is in (cur_pred, succ]
         if self._in_range(potential_pred_id, cur_pred_id, succ.node_id):
             succ.predecessor_id = potential_pred_id
 
     def _stabilize_one_node(self, node_id: int) -> None:
         """
-        对某一个 alive 节点执行一次 Chord stabilize 协议。
+        Perform one round of Chord stabilize for a single alive node.
 
-        伪代码：
+        for example：
           n = this node
           x = successor.predecessor
           if x in (n, successor): successor = x
@@ -762,8 +854,7 @@ class Network:
         if succ_id is None:
             return
 
-        # 跳过 crash 的 successor（用 successor.successor 一直往前跳）
-        # 注意最多跳 len(nodes) 次，防止死循环
+        # skip crashed successors; stop if too many hops
         hops = 0
         while True:
             succ = self.processors.get(succ_id)
@@ -784,21 +875,21 @@ class Network:
         if x_id is not None:
             x = self.processors.get(x_id)
             if x is not None and x.alive:
-                # 如果 x 在 (n, succ] 区间内，则更新 successor = x
                 if self._in_range(x.node_id, n.node_id, succ.node_id):
                     n.successor_id = x.node_id
-                    succ = x  # 新 successor
+                    succ = x
 
-        # 通知 successor：我可能是你的 predecessor
         self._notify(succ.node_id, n.node_id)
+        # >>> ADDED: after stabilizing successor, rebuild successor_list for n
+        self._rebuild_successor_list_for(n.node_id)
 
     def tick_once(self, max_nodes: int = 0) -> None:
         """
-        时间前进一格（逻辑时钟），这一格中随机选一些 alive 节点执行 stabilize。
+        Advance logical time by one tick. In this tick, some alive nodes
+        perform stabilize().
 
-        max_nodes = 0 表示“这一 tick 里所有 alive 节点都执行一次 stabilize”
-        max_nodes > 0 表示“随机选最多 max_nodes 个节点执行”
-        max_nodes < 0 表示不限制
+        max_nodes = 0   all alive nodes stabilize
+        max_nodes > 0   randomly choose at most max_nodes alive nodes
         """
         alive_ids = [nid for nid, p in self.processors.items() if p.alive]
         if not alive_ids:
@@ -816,23 +907,74 @@ class Network:
 
     def route_find_key_from(self, start_label: Any, key_label: Any) -> Dict[str, Any]:
         """
-        从 start_label 节点出发，模拟 Chord finger table 查找 key_label。
-        内部会用 ideal结果检查是否一致，不一致时自动执行一次全网 stabilize 并重试一次。
+        Simulate a Chord lookup for key_label starting from start_label.
+        The result is compared to the ideal responsible node (based on
+        the current global view) to detect inconsistency.
 
-        返回:
+        Returns:
           {
             "path_external": [...],
             "responsible_node": Optional[str],
             "stored": bool,
-            "consistent": bool,   # routing_end vs ideal 是否一致
-            "retries": int        # 为了得到最终结果做了几次 routing
+            "consistent": bool,   # routing_end vs ideal and ideal alive
+            "retries": int        # how many routing attempts were made
           }
         """
         key_str = str(key_label)
         key_id = self._hash_to_id(key_str)
 
+        # find primary (mathematical) and a live owner (replica-aware)
+        def _find_owner_and_primary():
+            """
+            Determine the primary node (mathematical responsible node) for this key,
+            and try to locate a live replica that actually stores the key.
+
+            Returns:
+                owner_id: internal id of a live node that stores the key (or None)
+                primary_id: internal id of the mathematical primary
+                primary_alive: whether the primary node is alive
+                stored: True if some live node stores the key
+            """
+            primary_id = self._find_responsible_node_id(key_id)
+            primary_proc = self.processors[primary_id]
+            primary_alive = primary_proc.alive
+
+            owner_id = None
+            stored = False
+
+            # First prefer the primary if it is alive and still holds the key
+            if primary_alive and primary_proc.has_key(key_str):
+                owner_id = primary_id
+                stored = True
+                return owner_id, primary_id, primary_alive, stored
+
+            # Otherwise, walk along successors to find a live replica.
+            steps = 0
+            current_id = primary_id
+            visited_local: Set[int] = set()
+
+            while steps < max(1, self.replication_factor):
+                if current_id in visited_local:
+                    break
+                visited_local.add(current_id)
+
+                proc = self.processors.get(current_id)
+                if proc is not None and proc.alive and proc.has_key(key_str):
+                    owner_id = current_id
+                    stored = True
+                    break
+
+                next_id = self._first_alive_successor(current_id)
+                if next_id is None or next_id == current_id:
+                    break
+
+                current_id = next_id
+                steps += 1
+
+            return owner_id, primary_id, primary_alive, stored
+
+
         def _route_once() -> (List[int], Optional[int]):
-            # 起点
             start_str = str(start_label)
             start_id = self.node_label_to_id.get(start_str)
             if start_id is None or not self.processors[start_id].alive:
@@ -848,37 +990,25 @@ class Network:
 
             for _ in range(max_hops):
                 if current_id in visited:
-                    # 已经绕回来了，说明拓扑有问题，停止
+                    # loop detected, stop
                     break
                 visited.add(current_id)
 
                 path.append(current_id)
                 cur_proc = self.processors[current_id]
 
-                # 找 successor（跳过 crashed 的）
-                succ_id = cur_proc.successor_id
-                hops = 0
-                while succ_id is not None and not self.processors[succ_id].alive:
-                    succ_id = self.processors[succ_id].successor_id
-                    hops += 1
-                    if hops > len(self.processors):
-                        succ_id = None
-                        break
-
+                # find successor with successor_list
+                succ_id = self._first_alive_successor(current_id)
                 if succ_id is None:
-                    # 没 successor，路由终止
                     break
 
-                # ① key 在 (current, succ] 上 → succ 是负责节点，结束
+                # if key is in (current, succ], succ is responsible
                 if self._in_range(key_id, current_id, succ_id):
                     path.append(succ_id)
                     current_id = succ_id
                     break
 
-                # ② 否则找 “closest preceding finger”
                 next_id = self._closest_preceding_finger_alive(current_id, key_id)
-
-                # finger 帮不上忙 → 至少往 successor 方向走一步
                 if next_id is None or next_id == current_id:
                     next_id = succ_id
 
@@ -886,7 +1016,7 @@ class Network:
 
             return path, current_id
 
-        # 第一次 routing
+        # first routing attempt
         path_internal, end_id = _route_once()
         retries = 1
 
@@ -899,45 +1029,31 @@ class Network:
                 "retries": retries,
             }
 
-        # ideal 负责节点（数学正确答案）
-        ideal_id = self._find_responsible_node_id(key_id)
-        ideal_proc = self.processors[ideal_id]
-        ideal_alive = ideal_proc.alive
+        # use replica-aware owner instead of a single ideal node
+        owner_id, primary_id, primary_alive, stored = _find_owner_and_primary()
+        consistent = (owner_id is not None and end_id == owner_id)
 
-        consistent = (end_id == ideal_id and ideal_alive)
-
-        # 不一致时会多轮触发部分节点的 stabilize，并在每轮之后重试路由，直到正确或达到最大尝试次数
+        # find out how many rounds of partial stabilize + re-routing need until consistent
         max_retries = 10
         while not consistent and retries < max_retries:
-        #if not consistent:
-            # 全网 stabilize 一轮
-            #self.tick_once(max_nodes=0)
             alive_ids = [nid for nid, p in self.processors.items() if p.alive]
             k = max(1, len(alive_ids) // 2)
-            print("k is:",k)
             self.tick_once(max_nodes=k)
 
-            # 再路由一次
             path_internal, end_id = _route_once()
             retries += 1
 
             if end_id is None:
-                # 拓扑太乱了，提前跳出；consistent 维持 False
                 break
-            # 再对比
-            ideal_id = self._find_responsible_node_id(key_id)
-            ideal_proc = self.processors[ideal_id]
-            ideal_alive = ideal_proc.alive
-            consistent = (end_id == ideal_id and ideal_alive)
 
-        # 最终负责节点：我们选择 ideal 作为最终判定者
-        if not ideal_alive:
+            owner_id, primary_id, primary_alive, stored = _find_owner_and_primary()
+            consistent = (owner_id is not None and end_id == owner_id)
+
+        if owner_id is None:
+            # No live replica holds this key
             responsible_label = None
-            stored = False
         else:
-            responsible_label = self.node_id_to_label.get(ideal_id, str(ideal_id))
-            # 注意：我们用 external key_str 检查是否真的存了这个 key
-            stored = ideal_proc.has_key(key_str)
+            responsible_label = self.node_id_to_label.get(owner_id, str(owner_id))
 
         path_external = [
             self.node_id_to_label.get(nid, str(nid)) for nid in path_internal
@@ -951,9 +1067,7 @@ class Network:
             "retries": retries,
         }
 
-    # ------------------------------------------------------------------
-    # helper accessors (useful for CLI and router)
-    # ------------------------------------------------------------------
+    # helper accessors (for CLI and router)
 
     def get_processor(self, internal_id: int) -> Optional[Processor]:
         return self.processors.get(internal_id)

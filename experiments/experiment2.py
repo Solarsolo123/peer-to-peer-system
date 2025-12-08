@@ -4,7 +4,7 @@ import random
 import matplotlib.pyplot as plt
 #random.seed(26)
 
-# 确保可以 import src 内的代码
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from core.network import Network
