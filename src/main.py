@@ -132,7 +132,7 @@ def main() -> None:
                 continue
 
             proc_label = parts[1]
-            result = net.add_processor(proc_label)
+            result = net.add_processor(proc_label,current_node_label)
 
             if not result["success"]:
                 print("[Error]", result["error"])
