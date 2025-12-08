@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse, random
-from multiprocessing.spawn import old_main_modules
 from pathlib import Path
 
 from src.core.network import Network
@@ -9,13 +8,10 @@ from src.utils.initial_loader import load_initial_data
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Chord-style P2P network simulator"
-    )
+    parser = argparse.ArgumentParser(description="Chord-style P2P network simulator")
 
-    default_config_path = (
-        Path(__file__).parent / "initialdata" / "small.json"
-    )
+    # you can change to other json file you want
+    default_config_path = (Path(__file__).parent / "initialdata" / "small.json")
 
     parser.add_argument(
         "--config",
@@ -41,7 +37,6 @@ def main() -> None:
     alive_ids = [nid for nid, p in net.processors.items() if p.alive]
     entry_id = random.choice(alive_ids)
     current_node_label = net.node_id_to_label[entry_id]
-    #current_node_label = '30'
 
     print(f"You are attached to node {current_node_label}")
 
@@ -53,7 +48,7 @@ def main() -> None:
     print("  find <keyLabel>                - route a lookup for the given key")
     print("  add <processorLabel>           - create a new processor")
     print("  end <processorLabel>           - gracefully remove a processor")
-    print("  crash <processorLabel>         - crash a processor (no key migration)")
+    print("  crash <processorLabel>         - crash a processor")
     print("  show                           - print current network state")
     print("  step                           - run one full stabilization step")
     print("  quit                           - exit the program")
@@ -62,7 +57,6 @@ def main() -> None:
         try:
             line = input("> ")
         except EOFError:
-            # handle Ctrl+D or input stream closed
             print()
             break
 

@@ -14,8 +14,6 @@ def successor_only_lookup(net: Network, start_id: int, key_id: int):
     current = start_id
     visited = set()
 
-
-
     while True:
         if current in visited:
             return None, hops
@@ -53,7 +51,6 @@ def run_experiment():
         net = Network(m_bits)
         net.init_from_labels(node_labels, key_labels)
 
-        # pick one start node
         start_label = node_labels[0]
         start_id = net.get_internal_node_id(start_label)
 
@@ -106,7 +103,6 @@ def plot_results(sizes, finger_avg, succ_avg):
     plt.title("Experiment 1: Finger vs Successor-only Routing")
     plt.grid(True, which="both", linestyle="--", alpha=0.4)
     plt.legend()
-
 
     plt.tight_layout()
     plt.savefig("experiment1_lookup_performance.png", dpi=300)

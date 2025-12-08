@@ -6,14 +6,14 @@ from src.core.processor import Processor
 
 class Network:
     """
-    Global view of the P2P / Chord-style ring.
+    Global view of the Chord ring.
 
     Responsibilities:
       - hold all processors (internal Chord IDs)
       - maintain mapping between external labels and internal IDs
-      - build the ring (successor / predecessor)
+      - build the ring
       - assign keys to processors based on Chord rule
-      - later: handle find/add/end/crash operations
+      - find/add/end/crash operations
     """
 
     def __init__(self, m_bits: int) -> None:
@@ -27,7 +27,6 @@ class Network:
         self._sorted_node_ids: List[int] = []
 
         # mappings for nodes
-        # external label is stored as string for consistency
         self.node_label_to_id: Dict[str, int] = {}
         self.node_id_to_label: Dict[int, str] = {}
 
@@ -40,45 +39,36 @@ class Network:
         self.successor_list_size: int = 3
         # total number of replicas per key (primary + secondaries)
         self.replication_factor: int = 3
-        # remember initial node count for sanity checks
-        self._initial_node_count: int = 0
 
 
-    # public initialization API
-    def init_from_labels(
-        self, node_labels: List[Any], key_labels: List[Any]
-    ) -> None:
+    # public initialization
+    def init_from_labels(self, node_labels: List[Any], key_labels: List[Any]) -> None:
         """
-        Initialize the network from external labels.
+        Initialize the network from .json.
 
         Args:
-            node_labels: external identifiers for nodes (any type, will be str())
-            key_labels: external identifiers for keys (any type, will be str())
+            node_labels: external identifiers for nodes
+            key_labels: external identifiers for keys
 
         Steps:
-          1) map node labels to internal IDs using SHA-1 and create processors
-          2) build successor / predecessor ring on internal IDs
-          3) assign keys (with replication) to processors
-          4) build finger tables (in initial phase, it is centralized, mainly for convergence speed)
+          1. map node labels to internal IDs using SHA-1 and create processors
+          2. build successor / predecessor ring on internal IDs
+          3. assign keys (with replication) to processors
+          4. build finger tables (in initial phase, it is centralized)
         """
         if not node_labels:
             raise ValueError("Cannot initialize network with empty node label list")
 
-        # 1) create processors from external node labels
+        # create processors from external node labels
         self._create_processors_from_labels(node_labels)
 
-
-        # >>> ADDED: set initial and minimal alive count after creation
-        self._initial_node_count = len(self.processors)
-
-
-        # 2) build ring based on initial data file
+        # build ring based on initial data file
         self._build_ring()
 
-        # 3) assign keys based on external key labels
+        # assign keys based on external key labels
         self._assign_keys_from_labels(key_labels)
 
-        # 4) build finger tables
+        # build finger tables
         self.build_finger_tables()
 
 
@@ -86,8 +76,7 @@ class Network:
 
     def _hash_to_id(self, label: str) -> int:
         """
-        Map an external label to an internal Chord ID using SHA-1,
-        then mod 2^m_bits.
+        Map an external label to an internal Chord ID using SHA-1, then mod 2^m_bits.
         """
         h = hashlib.sha1(label.encode("utf-8")).hexdigest()
         h_int = int(h, 16)
@@ -161,11 +150,6 @@ class Network:
     def _assign_keys_from_labels(self, key_labels: List[Any]) -> None:
         """
         Map external key labels to internal key IDs and assign them to processors.
-
-        External labels are converted to strings, hashed to internal IDs,
-        and then assigned using the Chord rule:
-          responsible node is the first node with id >= key_id,
-          or the smallest node id if none.
         """
         self.key_label_to_id.clear()
         self.key_id_to_labels.clear()
@@ -208,7 +192,7 @@ class Network:
             print(f"  successor_list: {[self.node_id_to_label.get(s, s) for s in proc.successor_list]}")
             print()
 
-    ###?????####
+
     # count alive nodes
     def _alive_count(self) -> int:
         return sum(1 for p in self.processors.values() if p.alive)
@@ -238,7 +222,7 @@ class Network:
 
         n.set_successor_list(successors)
 
-    # >>> ADDED: helper to choose the first alive successor using successor_list
+    # choose the first alive successor using successor_list
     def _first_alive_successor(self, node_id: int) -> Optional[int]:
         """
         Try direct successor, then successor_list, then fall back to successor chain.
@@ -247,17 +231,17 @@ class Network:
         if n is None:
             return None
 
-        # 1) direct successor
+        # direct successor
         sid = n.successor_id
         if sid is not None and sid in self.processors and self.processors[sid].alive:
             return sid
 
-        # 2) successor_list
+        # successor_list
         for cand in n.successor_list:
             if cand is not None and cand in self.processors and self.processors[cand].alive:
                 return cand
 
-        # 3) follow successor chain as last resort
+        # follow successor chain
         succ_id = n.successor_id
         hops = 0
         max_hops = len(self.processors)
@@ -275,7 +259,6 @@ class Network:
     def add_processor(self, processor_label: Any, start_label: Any = None):
         """
         Add a new processor to the ring in a more Chord-like way:
-
           1) compute the new node ID from its label;
           2) starting from a given node (or some alive node), route using the
              finger tables to find the successor responsible for this ID;
@@ -286,7 +269,7 @@ class Network:
         Finger tables are not globally rebuilt here; they can be refreshed
         later by tick_once() or other maintenance routines.
         """
-        # check masimum node number
+        # check maximum node number
         if len(self.processors) == self.max_id:
             return {
                 "success": False,
@@ -359,6 +342,7 @@ class Network:
 
         # choose predecessor：
         pred_id = succ.predecessor_id
+        # if pred_id isn't exist or predecessor is not alive,
         if pred_id is None or pred_id not in self.processors or not self.processors[pred_id].alive:
             ids = sorted(self.processors.keys())
             if succ_id in ids:
@@ -375,7 +359,7 @@ class Network:
         self.node_label_to_id[label] = internal_id
         self.node_id_to_label[internal_id] = label
 
-        # update global sorted list (for debug / ideal math)
+        # update global sorted list (for debug)
         self._sorted_node_ids = sorted(self.processors.keys())
 
         # move keys in (pred, new] from successor to the new node
@@ -401,16 +385,16 @@ class Network:
 
         # finger table is not globally rebuilt; new node copies succ's table
         proc.finger_table = list(succ.finger_table)
-        self.update_fingers_for_new_node(internal_id)
+        #self.update_fingers_for_new_node(internal_id)
 
         # re-establish replication for keys for which this new node becomes the primary responsible node
         for key in moved_keys:
-            key_id = self.key_label_to_id.get(key)
-            if key_id is None:
-                continue
-            ideal_id = self._find_responsible_node_id(key_id)
-            if ideal_id == internal_id:
-                self._replicate_key_to_successors(internal_id, key)
+            # key_id = self.key_label_to_id.get(key)
+            # if key_id is None:
+            #     continue
+            # ideal_id = self._find_responsible_node_id(key_id)
+            # if ideal_id == internal_id:
+            self._replicate_key_to_successors(internal_id, key)
 
         if moved_keys:
             return {
@@ -507,25 +491,25 @@ class Network:
         pred.set_successor(succ_id)
         succ.set_predecessor(pred_id)
 
-        # >>> ADDED: refresh successor lists for neighbors
+        # refresh successor lists for neighbors
         self._rebuild_successor_list_for(pred_id)
         self._rebuild_successor_list_for(succ_id)
 
-        # >>> ADDED: re-replicate keys for which successor is now primary
+        # re-replicate keys for which successor is now primary
         for l in moved_labels:
-            key_id = self.key_label_to_id.get(l)
-            if key_id is None:
-                continue
-            ideal_id = self._find_responsible_node_id(key_id)
-            if ideal_id == succ_id:
-                self._replicate_key_to_successors(succ_id, l)
+            # key_id = self.key_label_to_id.get(l)
+            # if key_id is None:
+            #     continue
+            # ideal_id = self._find_responsible_node_id(key_id)
+            # if ideal_id == succ_id:
+            self._replicate_key_to_successors(succ_id, l)
 
         # remove node from global structures
         del self.processors[internal_id]
         del self.node_label_to_id[label]
         del self.node_id_to_label[internal_id]
 
-        # update sorted list used for ideal math / debug
+        # update sorted list used for debug
         self._sorted_node_ids = sorted(self.processors.keys())
 
         # update finger tables entries pointing to this node
@@ -576,7 +560,6 @@ class Network:
                 "error": f"Processor '{label}' is already crashed.",
             }
 
-
         proc.alive = False
 
         return {
@@ -606,7 +589,6 @@ class Network:
             proc = self.processors[node_id]
             proc.set_successor(succ_id)
             proc.set_predecessor(pred_id)
-            # >>> ADDED: initialize successor_list using static ring order
             succ_list: List[Optional[int]] = []
             for offset in range(1, 1 + self.successor_list_size):
                 succ_list.append(ids[(i + offset) % n])
@@ -630,13 +612,11 @@ class Network:
             return key > pre or key <= new
 
 
-    # finger tables and Chord-style routing
+    # finger tables and routing
 
     def build_finger_tables(self) -> None:
         """
-        Build finger tables for all processors using the current ring.
-
-        Only used in initial phase
+        Build finger tables for all processors using the current ring. Only used in initial phase
         """
         alive_ids = [nid for nid, p in self.processors.items() if p.alive]
         alive_ids.sort()
@@ -696,7 +676,6 @@ class Network:
             if not p.alive:
                 continue
 
-
             if len(p.finger_table) < self.m_bits:
                 p.finger_table += [p.successor_id] * (self.m_bits - len(p.finger_table))
 
@@ -727,8 +706,7 @@ class Network:
 
     def _find_successor_via_routing(self, start_id: int, key_id: int) -> Optional[int]:
         """
-        Starting from start_id, route using Chord-style finger table
-        to find the alive successor responsible for key_id.
+        Starting from start_id, route using finger table to find the alive successor responsible for key_id.
 
         This roughly follows the same logic as route_find_key_from(),
         but only returns the final successor ID (or None on failure).

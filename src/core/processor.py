@@ -7,11 +7,10 @@ from typing import Optional, Set, Dict, Any, List
 @dataclass
 class Processor:
     """
-    A processor (node) in the P2P / Chord ring.
+    A processor (node) in the Chord ring.
     This class only stores local state and operates on its own keys
-    and neighbor pointers. Global operations are done by Network/Router.
+    and neighbor pointers. Global operations are done by network.py.
     """
-
     node_id: int
     label: str
     alive: bool = True
@@ -19,8 +18,7 @@ class Processor:
     # successor and predecessor are stored as node IDs.
     successor_id: Optional[int] = None
     predecessor_id: Optional[int] = None
-
-    # A list of candidate successors, usually of length r (e.g., r = 3 or 5).
+    # A list of candidate successors
     successor_list: List[Optional[int]] = field(default_factory=list)
 
     # keys currently stored on this processor (external key labels as str).
@@ -73,8 +71,6 @@ class Processor:
         self.successor_id = None
         self.predecessor_id = None
 
-
-
     def mark_alive(self) -> None:
         """Mark this processor as alive."""
         self.alive = True
@@ -82,7 +78,6 @@ class Processor:
     def mark_crashed(self) -> None:
         """Mark this processor as crashed."""
         self.alive = False
-
 
 
     def to_dict(self) -> Dict[str, Any]:
