@@ -383,7 +383,7 @@ class Network:
         self._rebuild_successor_list_for(succ_id)
         self._rebuild_successor_list_for(internal_id)
 
-        # finger table is not globally rebuilt; new node copies succ's table
+        # new node copies succ's table
         proc.finger_table = list(succ.finger_table)
         #self.update_fingers_for_new_node(internal_id)
 

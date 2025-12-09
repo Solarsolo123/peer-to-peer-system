@@ -43,7 +43,6 @@ class Processor:
     def move_all_keys_to(self, target: Processor) -> None:
         """
         Move all keys from this processor to the target processor.
-        After this call, self.keys will be empty.
         """
         if not self.keys:
             return
@@ -63,7 +62,6 @@ class Processor:
 
     def set_successor_list(self, successors: List[Optional[int]]) -> None:
         """Replace the successor list with a new list."""
-        # make a shallow copy to avoid accidental external modification
         self.successor_list = list(successors)
 
     def clear_neighbors(self) -> None:
