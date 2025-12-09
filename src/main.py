@@ -115,8 +115,8 @@ def main() -> None:
                 print("Route:", " -> ".join(result["path_external"]))
                 print("Responsible:", result["responsible_node"])
                 print("Stored:", result["stored"])
-                print("Consistent with ideal ring:", result["consistent"])
-                print("Routing retries:", result["retries"])
+                #print("Consistent with ideal ring:", result["consistent"])
+                #print("Routing retries:", result["retries"])
                 net.tick_once(max_nodes=2)
                 continue
 

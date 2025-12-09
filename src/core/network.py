@@ -1,6 +1,6 @@
 from __future__ import annotations
 import hashlib, random
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from src.core.processor import Processor
 
 
@@ -756,9 +756,6 @@ class Network:
         Fallback successor search that only walks along successor pointers.
         As long as the successor chain is not completely broken, this will
         eventually find the alive successor responsible for key_id.
-
-        Returns:
-            internal node ID of the successor, or None if not found.
         """
         if not self.processors:
             return None
@@ -858,7 +855,7 @@ class Network:
                     succ = x
 
         self._notify(succ.node_id, n.node_id)
-        # >>> ADDED: after stabilizing successor, rebuild successor_list for n
+        # after stabilizing successor, rebuild successor_list for n
         self._rebuild_successor_list_for(n.node_id)
 
     def tick_once(self, max_nodes: int = 0) -> None:
@@ -886,73 +883,18 @@ class Network:
     def route_find_key_from(self, start_label: Any, key_label: Any) -> Dict[str, Any]:
         """
         Simulate a Chord lookup for key_label starting from start_label.
-        The result is compared to the ideal responsible node (based on
-        the current global view) to detect inconsistency.
 
         Returns:
           {
             "path_external": [...],
             "responsible_node": Optional[str],
             "stored": bool,
-            "consistent": bool,   # routing_end vs ideal and ideal alive
-            "retries": int        # how many routing attempts were made
           }
         """
         key_str = str(key_label)
         key_id = self._hash_to_id(key_str)
 
-        # find primary (mathematical) and a live owner (replica-aware)
-        def _find_owner_and_primary():
-            """
-            Determine the primary node (mathematical responsible node) for this key,
-            and try to locate a live replica that actually stores the key.
-
-            Returns:
-                owner_id: internal id of a live node that stores the key (or None)
-                primary_id: internal id of the mathematical primary
-                primary_alive: whether the primary node is alive
-                stored: True if some live node stores the key
-            """
-            primary_id = self._find_responsible_node_id(key_id)
-            primary_proc = self.processors[primary_id]
-            primary_alive = primary_proc.alive
-
-            owner_id = None
-            stored = False
-
-            # First prefer the primary if it is alive and still holds the key
-            if primary_alive and primary_proc.has_key(key_str):
-                owner_id = primary_id
-                stored = True
-                return owner_id, primary_id, primary_alive, stored
-
-            # Otherwise, walk along successors to find a live replica.
-            steps = 0
-            current_id = primary_id
-            visited_local: Set[int] = set()
-
-            while steps < max(1, self.replication_factor):
-                if current_id in visited_local:
-                    break
-                visited_local.add(current_id)
-
-                proc = self.processors.get(current_id)
-                if proc is not None and proc.alive and proc.has_key(key_str):
-                    owner_id = current_id
-                    stored = True
-                    break
-
-                next_id = self._first_alive_successor(current_id)
-                if next_id is None or next_id == current_id:
-                    break
-
-                current_id = next_id
-                steps += 1
-
-            return owner_id, primary_id, primary_alive, stored
-
-
-        def _route_once() -> (List[int], Optional[int]):
+        def _route_once() -> Tuple[List[int], Optional[int]]:
             start_str = str(start_label)
             start_id = self.node_label_to_id.get(start_str)
             if start_id is None or not self.processors[start_id].alive:
@@ -975,9 +917,9 @@ class Network:
                 path.append(current_id)
                 cur_proc = self.processors[current_id]
 
-                # find successor with successor_list
                 succ_id = self._first_alive_successor(current_id)
                 if succ_id is None:
+                    # no alive successor reachable, stop routing
                     break
 
                 # if key is in (current, succ], succ is responsible
@@ -986,6 +928,7 @@ class Network:
                     current_id = succ_id
                     break
 
+                # keep finger-based step, fall back to successor if needed
                 next_id = self._closest_preceding_finger_alive(current_id, key_id)
                 if next_id is None or next_id == current_id:
                     next_id = succ_id
@@ -994,58 +937,53 @@ class Network:
 
             return path, current_id
 
-        # first routing attempt
+        # first and only routing attempt
         path_internal, end_id = _route_once()
-        retries = 1
-
-        if end_id is None:
-            return {
-                "path_external": [],
-                "responsible_node": None,
-                "stored": False,
-                "consistent": False,
-                "retries": retries,
-            }
-
-        # use replica-aware owner instead of a single ideal node
-        owner_id, primary_id, primary_alive, stored = _find_owner_and_primary()
-        consistent = (owner_id is not None and end_id == owner_id)
-
-        # find out how many rounds of partial stabilize + re-routing need until consistent
-        max_retries = 10
-        while not consistent and retries < max_retries:
-            alive_ids = [nid for nid, p in self.processors.items() if p.alive]
-            k = max(1, len(alive_ids) // 2)
-            self.tick_once(max_nodes=k)
-
-            path_internal, end_id = _route_once()
-            retries += 1
-
-            if end_id is None:
-                break
-
-            owner_id, primary_id, primary_alive, stored = _find_owner_and_primary()
-            consistent = (owner_id is not None and end_id == owner_id)
-
-        if owner_id is None:
-            # No live replica holds this key
-            responsible_label = None
-        else:
-            responsible_label = self.node_id_to_label.get(owner_id, str(owner_id))
 
         path_external = [
             self.node_id_to_label.get(nid, str(nid)) for nid in path_internal
         ]
 
+        if end_id is None:
+            # no valid end node
+            return {
+                "path_external": path_external,
+                "responsible_node": None,
+                "stored": False,
+            }
+
+        end_proc = self.processors[end_id]
+
+        stored_anywhere = False
+        responsible_label: Optional[str] = None
+
+        if end_proc.alive and end_proc.has_key(key_str):
+            stored_anywhere = True
+            responsible_label = end_proc.label
+        elif end_proc.alive and not end_proc.has_key(key_str):
+            stored_anywhere = False
+            responsible_label = end_proc.label
+        else: #end_proc is not alive
+            for end_succ_id in end_proc.successor_list:
+                if end_succ_id is None:
+                    continue
+                succ = self.processors[end_succ_id]
+                if not succ.alive:
+                    path_internal.append(end_succ_id)
+                    continue
+                if succ.has_key(key_str):
+                    path_internal.append(end_succ_id)
+                    stored_anywhere = True
+                    responsible_label = succ.label
+                    break
+
         return {
             "path_external": path_external,
             "responsible_node": responsible_label,
-            "stored": stored,
-            "consistent": consistent,
-            "retries": retries,
+            "stored": stored_anywhere,
         }
 
-    # helper accessors (for CLI and router)
+    # helper accessors
 
     def get_processor(self, internal_id: int) -> Optional[Processor]:
         return self.processors.get(internal_id)
